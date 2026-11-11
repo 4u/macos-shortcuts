@@ -1,0 +1,141 @@
+#!/bin/sh
+# macOS: install a per-user LaunchAgent for each shortcut.
+exec /usr/bin/perl -x "$0" "$@"
+#!perl
+use strict;
+use warnings;
+use Digest::SHA qw(sha256_hex);
+use Fcntl qw(:flock);
+use File::Path qw(make_path);
+use File::Temp qw(tempdir);
+use JSON::PP;
+
+my $usage = <<'USAGE';
+shortcut-cron.sh add "Shortcut name" "minute hour day month weekday"
+shortcut-cron.sh remove "Shortcut name"
+shortcut-cron.sh list
+
+Numeric cron fields support *, lists, ranges and steps. Sunday = 0 or 7.
+Adding the same name replaces its schedule. Times use the Mac's local clock.
+USAGE
+my ($action, $name, $schedule) = @ARGV;
+if (!@ARGV || $action eq '--help' || $action eq '-h') { print $usage; exit }
+die $usage unless ($action eq 'list' && @ARGV == 1)
+    || ($action eq 'remove' && @ARGV == 2)
+    || ($action eq 'add' && @ARGV == 3);
+die "Invalid shortcut name\n" if defined $name && ($name eq '' || $name =~ /[[:cntrl:]]/);
+
+# Decode argv before serializing names as UTF-8 JSON for plutil.
+use Encode qw(decode FB_CROAK);
+my $id = defined $name ? sha256_hex($name) : '';
+$name = decode('UTF-8', $name, FB_CROAK) if defined $name;
+my $agents = "$ENV{HOME}/Library/LaunchAgents";
+my $state = "$ENV{HOME}/Library/Application Support/shortcut-cron";
+my $prefix = 'local.shortcut-cron.';
+my $label = "$prefix$id";
+my $plist = "$agents/$label.plist";
+my $domain = "gui/$<";
+my $json = JSON::PP->new->utf8;
+umask 0077;
+make_path($state, $agents);
+open my $lock, '>>', "$state/manage.lock" or die "Open lock: $!";
+flock($lock, LOCK_EX) or die "Lock: $!";
+
+sub parse_field {
+    my ($field, $min, $max) = @_;
+    my %values;
+    for my $part (split /,/, $field, -1) {
+        my ($base, $step) = $part =~ m{\A(\*|\d+(?:-\d+)?)(?:/(\d+))?\z}
+            or die "Invalid cron field: $field\n";
+        my ($lo, $hi) = ($min, $max);
+        if ($base ne '*') {
+            ($lo, $hi) = split /-/, $base;
+            $hi //= defined($step) ? $max : $lo;
+        }
+        $step //= 1;
+        die "Invalid range or step: $field\n"
+            unless $lo >= $min && $hi <= $max && $lo <= $hi && $step > 0;
+        for (my $i = $lo; $i <= $hi; $i += $step) { $values{0 + $i} = 1 }
+    }
+    return \%values;
+}
+
+if ($action eq 'list') {
+    opendir my $dir, $agents or die "$agents: $!";
+    my @files = sort grep { /^\Q$prefix\E[0-9a-f]{64}\.plist\z/ } readdir $dir;
+    my @rows;
+    for my $file (@files) {
+        open my $in, '-|', 'plutil', '-convert', 'json', '-o', '-', "$agents/$file" or die $!;
+        my $data = do { local $/; <$in> };
+        close $in or die "Cannot read $file\n";
+        my $args = $json->decode($data)->{ProgramArguments};
+        push @rows, "$args->[-2]\t$args->[-1]\n";
+    }
+    binmode STDOUT, ':encoding(UTF-8)';
+    print @rows ? sort(@rows) : "No scheduled shortcuts.\n";
+    exit;
+}
+
+my $temp = tempdir('.shortcut-cron-XXXXXXXX', DIR => $agents, CLEANUP => 1);
+if ($action eq 'add') {
+    my @fields = split ' ', $schedule;
+    die "Expected five numeric cron fields\n" unless @fields == 5;
+    my @bounds = ([0,59], [0,23], [1,31], [1,12], [0,7]);
+    my @sets = map { parse_field($fields[$_], @{$bounds[$_]}) } 0..4;
+    $sets[4]{0} = 1 if delete $sets[4]{7};
+    # Standard cron combines restricted day-of-month and weekday with OR.
+    my $either_day = $fields[2] !~ /^\*/ && $fields[4] !~ /^\*/ ? 1 : 0;
+    my $runner = <<'RUN';
+use strict;
+use warnings;
+use JSON::PP;
+my ($rule, $either_day, $schedule, $name) = @ARGV;
+my $sets = decode_json($rule);
+my (undef, $minute, $hour, $day, $month, undef, $weekday) = localtime;
+exit unless $sets->[0]{$minute} && $sets->[1]{$hour} && $sets->[3]{$month + 1};
+my ($dom, $dow) = ($sets->[2]{$day}, $sets->[4]{$weekday});
+exit unless $either_day ? ($dom || $dow) : ($dom && $dow);
+exec '/usr/bin/shortcuts', 'run', '--', $name or die "shortcuts: $!";
+RUN
+    my $job = {
+        Label => $label,
+        StartCalendarInterval => {},
+        ProgramArguments => ['/usr/bin/perl', '-e', $runner, '--',
+            $json->encode(\@sets), "$either_day", join(' ', @fields), $name],
+    };
+    open my $out, '>:raw', "$temp/job.json" or die $!;
+    print {$out} $json->encode($job);
+    close $out or die $!;
+    system('plutil', '-convert', 'xml1', '-o', "$temp/new.plist", "$temp/job.json") == 0
+        or die "Could not create LaunchAgent\n";
+}
+
+sub is_loaded {
+    open my $saved, '>&', \*STDOUT or die $!;
+    open my $errors, '>&', \*STDERR or die $!;
+    open STDOUT, '>', '/dev/null' or die $!;
+    open STDERR, '>&', \*STDOUT or die $!;
+    my $ok = system('launchctl', 'print', "$domain/$label") == 0;
+    open STDOUT, '>&', $saved or die $!;
+    open STDERR, '>&', $errors or die $!;
+    return $ok;
+}
+my $old = -f $plist;
+link($plist, "$temp/previous") or die "Backup failed: $!" if $old && $action eq 'add';
+my $loaded = is_loaded();
+if ($loaded) {
+    system('launchctl', 'bootout', "$domain/$label") == 0 or die "Could not unload job\n";
+}
+if ($action eq 'remove') {
+    unlink($plist) or die "Cannot remove $plist: $!\n" if -e $plist;
+    print "Schedule removed.\n";
+    exit;
+}
+my $installed = rename("$temp/new.plist", $plist);
+if (!$installed || system('launchctl', 'bootstrap', $domain, $plist) != 0) {
+    if ($old && $installed) { rename("$temp/previous", $plist) or die "Restore: $!" }
+    if (!$old && $installed) { unlink($plist) or die "Cleanup: $!" }
+    if ($loaded) { system('launchctl', 'bootstrap', $domain, $plist) == 0 or die "Restore launch failed\n" }
+    die "Could not install schedule\n";
+}
+print "Schedule saved.\n";
